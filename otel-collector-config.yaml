@@ -1,47 +1,83 @@
+# Ovok Builder edge OTel collector.
+#
+# Receives OTLP HTTP/gRPC from the ovok-builder service (browser + API)
+# and forwards everything to the self-hosted SigNoz stack on ECS.
+# Two reasons this sits in front of SigNoz instead of the apps talking
+# to SigNoz directly:
+#   1. CORS termination — the SigNoz collector on ECS does not return
+#      Access-Control-Allow-Origin, so the browser SDK's preflight to
+#      /v1/traces 405s. The official OTel collector's HTTP receiver
+#      handles CORS when configured below.
+#   2. Single forwarding chokepoint — sampling, redaction, and per-env
+#      routing can be added here later without redeploying the apps.
+#
+# Pinned image: otel/opentelemetry-collector:0.97.0 (see Dockerfile).
+# Bumped deliberately, not tracking :latest.
+
 receivers:
   otlp:
     protocols:
       grpc:
       http:
-
-exporters:
-  debug:
-    verbosity: detailed
-
-  prometheus:
-    endpoint: "0.0.0.0:8889"
-    const_labels:
-      label1: value1
-
-  logging:
-
-  zipkin:
-    endpoint: "http://zipkin.railway.internal:9411/api/v2/spans"
-    format: proto
-
-  otlp/jaeger:
-    endpoint: jaeger.railway.internal:4317
-    tls:
-      insecure: true
+        # CORS preflight handling for the browser bundle. The ovok-builder
+        # web app posts spans directly from the user's tab; without this
+        # the OPTIONS request fails and every span is dropped.
+        cors:
+          allowed_origins:
+            - https://builder.ovok.com
+            - https://*.up.railway.app
+          allowed_headers:
+            - content-type
+            - traceparent
+            - tracestate
+          max_age: 7200
 
 processors:
+  # Coalesce tab-burst spans into batches. Default settings work well
+  # for the modest volume the builder emits.
   batch:
 
+exporters:
+  # Forward to the SigNoz collector hosted on ECS via OTLP HTTP. The
+  # exporter retries 5xx / 429 / transport errors with exponential
+  # backoff before dropping batches.
+  otlphttp/signoz:
+    endpoint: https://signoz.ecs.actimi.com
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 5000
+
+  # Keep the debug exporter on for the first ~24h so the Railway log
+  # pane shows span flow. Remove once SigNoz confirms ingest.
+  debug:
+    verbosity: basic
+
 extensions:
+  # Railway healthcheck hits 13133/health (default port for the OTel
+  # collector's health_check extension). Keep this so the service stays
+  # marked healthy.
   health_check:
-  pprof:
-    endpoint: :1888
-  zpages:
-    endpoint: :55679
+    endpoint: 0.0.0.0:13133
 
 service:
-  extensions: [pprof, zpages, health_check]
+  extensions: [health_check]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging, zipkin, otlp/jaeger, debug]
+      exporters: [otlphttp/signoz, debug]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging, prometheus, debug]
+      exporters: [otlphttp/signoz]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/signoz]
